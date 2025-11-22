@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+set -e
+IFS=$'\n\t'
+
+FFMPEG="/usr/bin/ffmpeg"
+ZENITY="/usr/bin/zenity"
+NOTIFY="/usr/bin/notify-send"
+
+# Embedded functions to avoid dependency issues
+detect_video_codec() {
+    local input_file="$1"
+    local video_codec
+    video_codec=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$input_file" 2>/dev/null || echo "unknown")
+    echo "$video_codec"
+}
+
+detect_audio_streams() {
+    local input_file="$1"
+    local audio_streams
+    audio_streams=$(ffprobe -v error -select_streams a -show_entries stream=codec_name -of csv=p=0 "$input_file" 2>/dev/null)
+    if [[ -z "$audio_streams" ]]; then
+        echo "none"
+    else
+        echo "$audio_streams"
+    fi
+}
+
+has_aac_audio() {
+    local input_file="$1"
+    local audio_streams
+    audio_streams=$(detect_audio_streams "$input_file")
+    if [[ "$audio_streams" == "none" ]]; then
+        return 1
+    fi
+    if echo "$audio_streams" | grep -q "aac"; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+get_unique_filename() {
+    local dir="$1"
+    local name="$2"
+    local ext="$3"
+    local counter=1
+    if [[ ! -f "$dir/$name.$ext" ]]; then
+        echo "$name.$ext"
+        return 0
+    fi
+    while [[ -f "$dir/$name ($counter).$ext" ]]; do
+        ((counter++))
+    done
+    echo "$name ($counter).$ext"
+}
+
+# Convert non-AAC audio streams to AAC (192kb/s, 48kHz) and create a new .mp4 file
+for INPUT in "$@"; do
+  [[ -f "$INPUT" ]] || continue
+
+  DIR="$(dirname "$INPUT")"
+  BASENAME="$(basename "$INPUT")"
+  NAME="${BASENAME%.*}"
+
+  # Check if file already has AAC audio
+  if has_aac_audio "$INPUT"; then
+    $NOTIFY "To AAC" "Skipped: $BASENAME (already has AAC audio)"
+    continue
+  fi
+
+  # Check if file has audio streams at all
+  audio_streams=$(detect_audio_streams "$INPUT")
+  if [[ "$audio_streams" == "none" ]]; then
+    $NOTIFY "To AAC" "Skipped: $BASENAME (no audio streams found)"
+    continue
+  fi
+
+  # Smart container selection based on video codec
+  video_codec=$(detect_video_codec "$INPUT")
+  if [[ "$video_codec" == "dnxhd" ]]; then
+    # DNxHD/DNxHR requires .mov container
+    output_filename=$(get_unique_filename "$DIR" "$NAME" "mov")
+    TMP_OUTPUT="$(mktemp --tmpdir="$DIR" ".${NAME}.XXXXXX.mov")"
+    container_ext="mov"
+  else
+    # Other codecs work in .mp4 container
+    output_filename=$(get_unique_filename "$DIR" "$NAME" "mp4")
+    TMP_OUTPUT="$(mktemp --tmpdir="$DIR" ".${NAME}.XXXXXX.mp4")"
+    container_ext="mp4"
+  fi
+
+  # get duration (HH:MM:SS.ms)
+  DURATION=$($FFMPEG -i "$INPUT" 2>&1 | grep "Duration" | awk '{print $2}' | tr -d , || echo "00:00:00.00")
+  HOURS=${DURATION:0:2}
+  MINUTES=${DURATION:3:2}
+  SECONDS=${DURATION:6:5}
+  TOTAL_SEC=$(echo "$HOURS*3600 + $MINUTES*60 + $SECONDS" | bc)
+
+  (
+    $FFMPEG -y -i "$INPUT" \
+      -map 0 -map -0:d \
+      -c:v copy \
+      -c:a aac -b:a 192k -ar 48000 \
+      -c:s copy \
+      -map_metadata 0 \
+      "$TMP_OUTPUT" -progress pipe:1 2>/dev/null | \
+    while read -r line; do
+      if [[ "$line" =~ out_time_ms=([0-9]+) ]]; then
+        OUT_MS=${BASH_REMATCH[1]}
+        OUT_SEC=$(echo "$OUT_MS / 1000000" | bc)
+        if [[ "$TOTAL_SEC" -gt 0 ]]; then
+          PCT=$(echo "$OUT_SEC * 100 / $TOTAL_SEC" | bc)
+          if [[ "$PCT" -lt 0 ]]; then PCT=0; fi
+          if [[ "$PCT" -gt 100 ]]; then PCT=100; fi
+        else
+          PCT=0
+        fi
+        echo $PCT
+        echo "# Converting $BASENAME to AAC — $(date -u -d @$OUT_SEC +%T) elapsed"
+      fi
+    done
+  ) | $ZENITY --progress --title="To AAC (smart container)" --percentage=0 --auto-close --width=420
+
+  if [[ -f "$TMP_OUTPUT" ]]; then
+    FINAL="$DIR/$output_filename"
+    mv "$TMP_OUTPUT" "$FINAL"
+
+    # Check if filename was modified
+    if [[ "$output_filename" != "${NAME}.${container_ext}" ]]; then
+      $NOTIFY "To AAC" "Created: $output_filename (renamed to avoid overwrite, $container_ext container)"
+    else
+      $NOTIFY "To AAC" "Created: $output_filename ($container_ext container)"
+    fi
+  else
+    $NOTIFY "To AAC" "Conversion failed: $BASENAME"
+  fi
+done
