@@ -220,13 +220,6 @@ chmod +x ~/.local/share/kio/servicemenus/*.desktop
 - Verify file permissions and disk space
 - Ensure source files aren't corrupted
 
-### Getting Help
-
-For issues and feature requests:
-1. Check this README for common solutions
-2. Verify all dependencies are properly installed
-3. Test with small sample files first
-
 ## Uninstallation
 
 ### Automatic Uninstallation
